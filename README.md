@@ -1,6 +1,6 @@
 # Disclaimer
 
-Code was made by Claude, I don't care, it works, deal with it
+Code was made by Claude, I don't care, it works, deal with it  
 Still less lazy than GNOME developers 🤷🏻
 
 # file-roller
