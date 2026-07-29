@@ -1,0 +1,276 @@
+From 9f0355ea37cb362e8b22c43a2e0bbc959d31a198 Mon Sep 17 00:00:00 2001
+From: c <a@b>
+Date: Wed, 29 Jul 2026 17:59:24 +0200
+Subject: [PATCH] dnd: keep the selection intact when a drag starts
+
+GtkTreeView collapses a multi-row selection to the clicked row on button
+press, before the drag threshold can be reached, so pressing on one of
+several selected rows destroys the selection about to be dragged. GTK3
+deferred this to button release whenever the tree view was a drag
+source; the GTK4 port dropped the deferral.
+
+Restore it: when the press lands on an already-selected row of a
+multi-row selection, install a GtkTreeSelectionFunc returning FALSE.
+gtk_tree_selection_real_select_node() consults it for every row whose
+state would change, including the unselect-all pass, so the entire
+CLEAR_AND_SELECT becomes a no-op. If the button is released without a
+drag having started, apply the suppressed selection change instead.
+
+This is independent of the extraction support and can be dropped.
+---
+ src/fr-window-dnd.c | 211 ++++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 202 insertions(+), 9 deletions(-)
+
+diff --git a/src/fr-window-dnd.c b/src/fr-window-dnd.c
+index c48e1c9..ec42f79 100644
+--- a/src/fr-window-dnd.c
++++ b/src/fr-window-dnd.c
+@@ -421,11 +421,177 @@ fr_dnd_provider_init (FrDndProvider *self)
+ 
+ 
+ typedef struct {
+-	FrWindow *window;	/* not owned */
+-	gboolean  from_sidebar;
++	FrWindow    *window;		/* not owned */
++	gboolean     from_sidebar;
++
++	/* Deferred selection handling, see below. */
++	GtkTreePath *pending_path;	/* owned */
++	gboolean     selection_blocked;
++	gboolean     drag_started;
+ } SetupData;
+ 
+ 
++#define SETUP_KEY "fr-window-dnd-setup"
++
++
++static void
++setup_data_free (gpointer user_data)
++{
++	SetupData *setup = user_data;
++
++	g_clear_pointer (&setup->pending_path, gtk_tree_path_free);
++	g_free (setup);
++}
++
++
++/* -- deferred selection --
++ *
++ * GtkTreeView collapses a multi-row selection to the clicked row on button
++ * *press* (gtk_tree_view_click_gesture_pressed -> real_set_cursor with
++ * CLEAR_AND_SELECT), before the drag threshold can possibly be reached. GTK3
++ * deferred that to button release whenever the tree view was a drag source;
++ * the GTK4 port dropped the deferral, so pressing on one of several selected
++ * rows destroys the selection you were about to drag.
++ *
++ * We restore the deferral. When the press lands on an already-selected row of
++ * a multi-row selection, a GtkTreeSelectionFunc returning FALSE is installed:
++ * gtk_tree_selection_real_select_node() consults it for *every* row whose
++ * state would change, including the unselect-all pass, so the whole
++ * CLEAR_AND_SELECT becomes a no-op and the selection survives.
++ *
++ * If the button is then released without a drag having started, we apply the
++ * selection change that the tree view wanted to make in the first place.
++ */
++
++
++static gboolean
++_fr_dnd_block_selection_func (GtkTreeSelection *selection,
++			      GtkTreeModel     *model,
++			      GtkTreePath      *path,
++			      gboolean          path_currently_selected,
++			      gpointer          user_data)
++{
++	return FALSE;
++}
++
++
++static void
++_fr_dnd_unblock_selection (SetupData        *setup,
++			   GtkTreeSelection *selection)
++{
++	if (! setup->selection_blocked)
++		return;
++
++	setup->selection_blocked = FALSE;
++	gtk_tree_selection_set_select_function (selection, NULL, NULL, NULL);
++}
++
++
++static void
++_fr_dnd_pressed_cb (GtkGestureClick *gesture,
++		    int              n_press,
++		    double           x,
++		    double           y,
++		    gpointer         user_data)
++{
++	SetupData        *setup = user_data;
++	GtkWidget        *widget;
++	GtkTreeView      *tree_view;
++	GtkTreeSelection *selection;
++	GtkTreePath      *path = NULL;
++	GdkModifierType   state;
++	int               bx, by;
++
++	setup->drag_started = FALSE;
++	g_clear_pointer (&setup->pending_path, gtk_tree_path_free);
++
++	if (n_press != 1)
++		return;
++
++	widget = gtk_event_controller_get_widget (GTK_EVENT_CONTROLLER (gesture));
++	tree_view = GTK_TREE_VIEW (widget);
++	selection = gtk_tree_view_get_selection (tree_view);
++	if (selection == NULL)
++		return;
++
++	/* Ctrl and Shift have their own meaning; leave them alone. */
++	state = gtk_event_controller_get_current_event_state (GTK_EVENT_CONTROLLER (gesture));
++	if (state & (GDK_CONTROL_MASK | GDK_SHIFT_MASK))
++		return;
++
++	if (gtk_tree_selection_count_selected_rows (selection) < 2)
++		return;
++
++	gtk_tree_view_convert_widget_to_bin_window_coords (tree_view, x, y, &bx, &by);
++	if (! gtk_tree_view_get_path_at_pos (tree_view, bx, by, &path, NULL, NULL, NULL))
++		return;
++
++	if (! gtk_tree_selection_path_is_selected (selection, path)) {
++		gtk_tree_path_free (path);
++		return;
++	}
++
++	setup->pending_path = path;	/* takes ownership */
++	setup->selection_blocked = TRUE;
++	gtk_tree_selection_set_select_function (selection,
++						_fr_dnd_block_selection_func,
++						NULL,
++						NULL);
++}
++
++
++static void
++_fr_dnd_released_cb (GtkGestureClick *gesture,
++		     int              n_press,
++		     double           x,
++		     double           y,
++		     gpointer         user_data)
++{
++	SetupData        *setup = user_data;
++	GtkWidget        *widget;
++	GtkTreeView      *tree_view;
++	GtkTreeSelection *selection;
++
++	widget = gtk_event_controller_get_widget (GTK_EVENT_CONTROLLER (gesture));
++	tree_view = GTK_TREE_VIEW (widget);
++	selection = gtk_tree_view_get_selection (tree_view);
++	if (selection == NULL)
++		return;
++
++	_fr_dnd_unblock_selection (setup, selection);
++
++	/* No drag happened, so this was an ordinary click: apply the selection
++	 * change that was suppressed on press. */
++	if ((setup->pending_path != NULL) && ! setup->drag_started)
++		gtk_tree_view_set_cursor (tree_view, setup->pending_path, NULL, FALSE);
++
++	g_clear_pointer (&setup->pending_path, gtk_tree_path_free);
++	setup->drag_started = FALSE;
++}
++
++
++static void
++_fr_dnd_drag_end_cb (GtkDragSource *source,
++		     GdkDrag       *drag,
++		     gboolean       delete_data,
++		     gpointer       user_data)
++{
++	SetupData        *setup = user_data;
++	GtkWidget        *widget;
++	GtkTreeSelection *selection;
++
++	widget = gtk_event_controller_get_widget (GTK_EVENT_CONTROLLER (source));
++	if (widget != NULL) {
++		selection = gtk_tree_view_get_selection (GTK_TREE_VIEW (widget));
++		if (selection != NULL)
++			_fr_dnd_unblock_selection (setup, selection);
++	}
++
++	g_clear_pointer (&setup->pending_path, gtk_tree_path_free);
++	setup->drag_started = FALSE;
++}
++
++
+ static GdkContentProvider *
+ _fr_dnd_drag_prepare_cb (GtkDragSource *source,
+ 			 double         x,
+@@ -455,10 +621,14 @@ _fr_dnd_drag_begin_cb (GtkDragSource *source,
+ 		       GdkDrag       *drag,
+ 		       gpointer       user_data)
+ {
++	SetupData        *setup = user_data;
+ 	GtkWidget        *widget;
+ 	GtkIconTheme     *theme;
+ 	GtkIconPaintable *icon;
+ 
++	if (setup != NULL)
++		setup->drag_started = TRUE;
++
+ 	widget = gtk_event_controller_get_widget (GTK_EVENT_CONTROLLER (source));
+ 	if (widget == NULL)
+ 		return;
+@@ -493,6 +663,10 @@ fr_window_dnd_setup (FrWindow  *window,
+ 	setup->window = window;
+ 	setup->from_sidebar = from_sidebar;
+ 
++	/* Owned by the widget so that both the drag source and the click
++	 * gesture below can share it. */
++	g_object_set_data_full (G_OBJECT (widget), SETUP_KEY, setup, setup_data_free);
++
+ 	source = gtk_drag_source_new ();
+ 	gtk_drag_source_set_actions (source, GDK_ACTION_COPY);
+ 	gtk_gesture_single_set_button (GTK_GESTURE_SINGLE (source), GDK_BUTTON_PRIMARY);
+@@ -501,16 +675,35 @@ fr_window_dnd_setup (FrWindow  *window,
+ 	 * gets to update the selection before a drag can start. */
+ 	gtk_event_controller_set_propagation_phase (GTK_EVENT_CONTROLLER (source), GTK_PHASE_BUBBLE);
+ 
+-	g_signal_connect_data (source,
+-			       "prepare",
+-			       G_CALLBACK (_fr_dnd_drag_prepare_cb),
+-			       setup,
+-			       (GClosureNotify) g_free,
+-			       0);
++	g_signal_connect (source,
++			  "prepare",
++			  G_CALLBACK (_fr_dnd_drag_prepare_cb),
++			  setup);
+ 	g_signal_connect (source,
+ 			  "drag-begin",
+ 			  G_CALLBACK (_fr_dnd_drag_begin_cb),
+-			  NULL);
++			  setup);
++	g_signal_connect (source,
++			  "drag-end",
++			  G_CALLBACK (_fr_dnd_drag_end_cb),
++			  setup);
+ 
+ 	gtk_widget_add_controller (widget, GTK_EVENT_CONTROLLER (source));
++
++	/* Multi-row selections only exist in the file list. */
++	if (! from_sidebar) {
++		GtkGesture *click;
++
++		click = gtk_gesture_click_new ();
++		gtk_gesture_single_set_button (GTK_GESTURE_SINGLE (click), GDK_BUTTON_PRIMARY);
++
++		/* Capture phase: this must run before the tree view's own click
++		 * gesture collapses the selection. */
++		gtk_event_controller_set_propagation_phase (GTK_EVENT_CONTROLLER (click), GTK_PHASE_CAPTURE);
++
++		g_signal_connect (click, "pressed", G_CALLBACK (_fr_dnd_pressed_cb), setup);
++		g_signal_connect (click, "released", G_CALLBACK (_fr_dnd_released_cb), setup);
++
++		gtk_widget_add_controller (widget, GTK_EVENT_CONTROLLER (click));
++	}
+ }

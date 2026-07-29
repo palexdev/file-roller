@@ -1,0 +1,16 @@
+# Install to /etc/pacman.d/hooks/file-roller-dnd-check.hook
+#
+# pacman cannot upgrade file-roller-dnd (that is intentional -- it is named
+# differently so an upgrade can never silently revert the patch), so this hook
+# points out when upstream file-roller has moved on.
+
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Type = Package
+Target = *
+
+[Action]
+Description = Checking whether upstream file-roller is newer than file-roller-dnd...
+When = PostTransaction
+Exec = /usr/local/bin/file-roller-dnd-check

@@ -1,0 +1,658 @@
+From 9be6d8d80e215a6f426590ea3b333c3611ae59eb Mon Sep 17 00:00:00 2001
+From: c <a@b>
+Date: Wed, 29 Jul 2026 17:33:32 +0200
+Subject: [PATCH] src: restore drag-and-drop extraction from the archive
+
+The drag source was commented out during the GTK4 port and never
+reimplemented; the old implementation relied on XdndDirectSave, which
+inverts the Wayland data-transfer model.
+
+All the supporting machinery survived the port -- the drag_* private
+fields and fr_window_dnd_extraction_finished(), which is still called
+from every extraction completion path. This adds a GdkContentProvider
+advertising text/uri-list. Content providers write asynchronously, so
+the selection can be extracted into a temporary directory while the
+target reads, and the resulting local files handed over as an ordinary
+uri-list. No path travels backwards, so nothing Wayland-specific is
+needed.
+
+Temporary files live in $XDG_CACHE_HOME/file-roller/dnd/<pid>-<n> and
+directories owned by dead PIDs are swept on first use.
+---
+ src/fr-window-dnd.c | 516 ++++++++++++++++++++++++++++++++++++++++++++
+ src/fr-window-dnd.h |  50 +++++
+ src/fr-window.c     |   6 +
+ src/meson.build     |   2 +
+ 4 files changed, 574 insertions(+)
+ create mode 100644 src/fr-window-dnd.c
+ create mode 100644 src/fr-window-dnd.h
+
+diff --git a/src/fr-window-dnd.c b/src/fr-window-dnd.c
+new file mode 100644
+index 0000000..c48e1c9
+--- /dev/null
++++ b/src/fr-window-dnd.c
+@@ -0,0 +1,516 @@
++/* -*- Mode: C; tab-width: 8; indent-tabs-mode: t; c-basic-offset: 8 -*- */
++
++/*
++ *  File-Roller
++ *
++ *  Drag-and-drop extraction. See fr-window-dnd.h for the rationale.
++ */
++
++#include <config.h>
++#include <errno.h>
++#include <signal.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/types.h>
++#include <unistd.h>
++#include <glib/gstdio.h>
++#include <gtk/gtk.h>
++#include "fr-window-dnd.h"
++#include "glib-utils.h"
++
++/* Object-data key holding the DragExtraction currently in flight, if any.
++ * Only one drag extraction per window can be running at a time. */
++#define PENDING_KEY "fr-window-dnd-extraction"
++
++/* Icon used for the drag cursor. */
++#define DRAG_ICON_NAME "package-x-generic"
++
++
++/* -- temporary storage --
++ *
++ * Extracted files must outlive the drop: the file manager copies them only
++ * after it has read the uri-list. They are therefore not deleted when the
++ * drag ends. Instead each process extracts into
++ *
++ *   $XDG_CACHE_HOME/file-roller/dnd/<pid>-<n>/
++ *
++ * and directories belonging to processes that are no longer running are
++ * swept on first use. This keeps cleanup automatic without needing an exit
++ * handler, and without a shared directory that other sandboxes can see.
++ */
++
++
++static char *
++_fr_dnd_get_root_dir (void)
++{
++	return g_build_filename (g_get_user_cache_dir (), "file-roller", "dnd", NULL);
++}
++
++
++static void
++_fr_dnd_remove_recursive (GFile *file)
++{
++	GFileEnumerator *enumerator;
++
++	enumerator = g_file_enumerate_children (file,
++						G_FILE_ATTRIBUTE_STANDARD_NAME ","
++						G_FILE_ATTRIBUTE_STANDARD_TYPE,
++						G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS,
++						NULL,
++						NULL);
++	if (enumerator != NULL) {
++		GFileInfo *info;
++
++		while ((info = g_file_enumerator_next_file (enumerator, NULL, NULL)) != NULL) {
++			GFile *child;
++
++			child = g_file_enumerator_get_child (enumerator, info);
++			if (g_file_info_get_file_type (info) == G_FILE_TYPE_DIRECTORY)
++				_fr_dnd_remove_recursive (child);
++			else
++				g_file_delete (child, NULL, NULL);
++
++			g_object_unref (child);
++			g_object_unref (info);
++		}
++
++		g_file_enumerator_close (enumerator, NULL, NULL);
++		g_object_unref (enumerator);
++	}
++
++	g_file_delete (file, NULL, NULL);
++}
++
++
++static gboolean
++_fr_dnd_pid_is_alive (pid_t pid)
++{
++	if (pid <= 0)
++		return FALSE;
++	if (kill (pid, 0) == 0)
++		return TRUE;
++
++	/* EPERM means the pid exists but belongs to someone else; only ESRCH
++	 * proves that nothing is using the directory any more. */
++	return (errno != ESRCH);
++}
++
++
++static void
++_fr_dnd_sweep_stale_dirs (const char *root)
++{
++	static gboolean swept = FALSE;
++	GDir       *dir;
++	const char *name;
++
++	if (swept)
++		return;
++	swept = TRUE;
++
++	dir = g_dir_open (root, 0, NULL);
++	if (dir == NULL)
++		return;
++
++	while ((name = g_dir_read_name (dir)) != NULL) {
++		char  *endptr = NULL;
++		gint64 pid;
++
++		pid = g_ascii_strtoll (name, &endptr, 10);
++		if ((endptr == name) || (*endptr != '-'))
++			continue;
++		if (_fr_dnd_pid_is_alive ((pid_t) pid))
++			continue;
++
++		{
++			char  *path = g_build_filename (root, name, NULL);
++			GFile *file = g_file_new_for_path (path);
++
++			_fr_dnd_remove_recursive (file);
++
++			g_object_unref (file);
++			g_free (path);
++		}
++	}
++
++	g_dir_close (dir);
++}
++
++
++static char *
++_fr_dnd_create_temp_dir (GError **error)
++{
++	static int  counter = 0;
++	char       *root;
++	char       *path;
++
++	root = _fr_dnd_get_root_dir ();
++	if (g_mkdir_with_parents (root, 0700) != 0) {
++		g_set_error (error, G_IO_ERROR, g_io_error_from_errno (errno),
++			     "Could not create %s: %s", root, g_strerror (errno));
++		g_free (root);
++		return NULL;
++	}
++
++	_fr_dnd_sweep_stale_dirs (root);
++
++	path = g_strdup_printf ("%s%c%d-%d", root, G_DIR_SEPARATOR, (int) getpid (), counter++);
++	g_free (root);
++
++	if (g_mkdir_with_parents (path, 0700) != 0) {
++		g_set_error (error, G_IO_ERROR, g_io_error_from_errno (errno),
++			     "Could not create %s: %s", path, g_strerror (errno));
++		g_free (path);
++		return NULL;
++	}
++
++	return path;
++}
++
++
++/* -- the extraction in flight -- */
++
++
++typedef struct {
++	GTask         *task;		/* owned */
++	GOutputStream *stream;		/* owned */
++	GFile         *destination;	/* owned */
++	char          *uri_list;	/* owned, valid once extraction succeeded */
++} DragExtraction;
++
++
++static void
++drag_extraction_free (gpointer user_data)
++{
++	DragExtraction *extraction = user_data;
++
++	g_clear_object (&extraction->task);
++	g_clear_object (&extraction->stream);
++	g_clear_object (&extraction->destination);
++	g_free (extraction->uri_list);
++	g_free (extraction);
++}
++
++
++/* Builds the text/uri-list payload from the top level of the destination
++ * directory. Because the selection is extracted with junk_paths = FALSE and
++ * with the current location as base_dir, the top level of the destination
++ * contains exactly the dragged entries. */
++static char *
++_fr_dnd_build_uri_list (GFile *destination)
++{
++	GFileEnumerator *enumerator;
++	GFileInfo       *info;
++	GString         *uris;
++
++	enumerator = g_file_enumerate_children (destination,
++						G_FILE_ATTRIBUTE_STANDARD_NAME,
++						G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS,
++						NULL,
++						NULL);
++	if (enumerator == NULL)
++		return NULL;
++
++	uris = g_string_new (NULL);
++	while ((info = g_file_enumerator_next_file (enumerator, NULL, NULL)) != NULL) {
++		GFile *child;
++		char  *uri;
++
++		child = g_file_enumerator_get_child (enumerator, info);
++		uri = g_file_get_uri (child);
++		g_string_append (uris, uri);
++		g_string_append (uris, "\r\n");
++
++		g_free (uri);
++		g_object_unref (child);
++		g_object_unref (info);
++	}
++
++	g_file_enumerator_close (enumerator, NULL, NULL);
++	g_object_unref (enumerator);
++
++	if (uris->len == 0) {
++		g_string_free (uris, TRUE);
++		return NULL;
++	}
++
++	return g_string_free (uris, FALSE);
++}
++
++
++static void
++_fr_dnd_write_ready_cb (GObject      *source_object,
++			GAsyncResult *result,
++			gpointer      user_data)
++{
++	DragExtraction *extraction = user_data;
++	GError         *error = NULL;
++
++	if (! g_output_stream_write_all_finish (G_OUTPUT_STREAM (source_object), result, NULL, &error))
++		g_task_return_error (extraction->task, error);
++	else
++		g_task_return_boolean (extraction->task, TRUE);
++
++	drag_extraction_free (extraction);
++}
++
++
++void
++fr_window_dnd_notify_extraction_finished (FrWindow *window,
++					  gboolean  error)
++{
++	DragExtraction *extraction;
++
++	extraction = g_object_steal_data (G_OBJECT (window), PENDING_KEY);
++	if (extraction == NULL)
++		return;
++
++	if (error) {
++		g_task_return_new_error (extraction->task,
++					 G_IO_ERROR,
++					 G_IO_ERROR_FAILED,
++					 "Could not extract the dragged files");
++		drag_extraction_free (extraction);
++		return;
++	}
++
++	extraction->uri_list = _fr_dnd_build_uri_list (extraction->destination);
++	if (extraction->uri_list == NULL) {
++		g_task_return_new_error (extraction->task,
++					 G_IO_ERROR,
++					 G_IO_ERROR_NOT_FOUND,
++					 "No files were extracted");
++		drag_extraction_free (extraction);
++		return;
++	}
++
++	g_output_stream_write_all_async (extraction->stream,
++					 extraction->uri_list,
++					 strlen (extraction->uri_list),
++					 G_PRIORITY_DEFAULT,
++					 g_task_get_cancellable (extraction->task),
++					 _fr_dnd_write_ready_cb,
++					 extraction);
++}
++
++
++/* -- FrDndProvider -- */
++
++
++#define FR_TYPE_DND_PROVIDER (fr_dnd_provider_get_type ())
++G_DECLARE_FINAL_TYPE (FrDndProvider, fr_dnd_provider, FR, DND_PROVIDER, GdkContentProvider)
++
++struct _FrDndProvider {
++	GdkContentProvider  parent_instance;
++	FrWindow           *window;		/* not owned */
++	gboolean            from_sidebar;
++};
++
++G_DEFINE_TYPE (FrDndProvider, fr_dnd_provider, GDK_TYPE_CONTENT_PROVIDER)
++
++
++static GdkContentFormats *
++fr_dnd_provider_ref_formats (GdkContentProvider *provider)
++{
++	GdkContentFormatsBuilder *builder;
++
++	builder = gdk_content_formats_builder_new ();
++	gdk_content_formats_builder_add_mime_type (builder, "text/uri-list");
++
++	return gdk_content_formats_builder_free_to_formats (builder);
++}
++
++
++static void
++fr_dnd_provider_write_mime_type_async (GdkContentProvider  *provider,
++				       const char          *mime_type,
++				       GOutputStream       *stream,
++				       int                  io_priority,
++				       GCancellable        *cancellable,
++				       GAsyncReadyCallback  callback,
++				       gpointer             user_data)
++{
++	FrDndProvider  *self = FR_DND_PROVIDER (provider);
++	GTask          *task;
++	GList          *files;
++	char           *base_dir = NULL;
++	char           *temp_dir;
++	DragExtraction *extraction;
++	GError         *error = NULL;
++
++	task = g_task_new (provider, cancellable, callback, user_data);
++	g_task_set_source_tag (task, fr_dnd_provider_write_mime_type_async);
++
++	if (self->window == NULL) {
++		g_task_return_new_error (task, G_IO_ERROR, G_IO_ERROR_CANCELLED,
++					 "The archive window is gone");
++		g_object_unref (task);
++		return;
++	}
++
++	files = fr_window_get_selection (self->window, self->from_sidebar, &base_dir);
++	if (files == NULL) {
++		g_task_return_new_error (task, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT,
++					 "Nothing to extract");
++		g_free (base_dir);
++		g_object_unref (task);
++		return;
++	}
++
++	temp_dir = _fr_dnd_create_temp_dir (&error);
++	if (temp_dir == NULL) {
++		g_task_return_error (task, error);
++		_g_string_list_free (files);
++		g_free (base_dir);
++		g_object_unref (task);
++		return;
++	}
++
++	extraction = g_new0 (DragExtraction, 1);
++	extraction->task = task;			/* takes ownership */
++	extraction->stream = g_object_ref (stream);
++	extraction->destination = g_file_new_for_path (temp_dir);
++
++	g_object_set_data (G_OBJECT (self->window), PENDING_KEY, extraction);
++
++	/* Completion arrives via fr_window_dnd_extraction_finished(), which
++	 * fr-window.c already calls on every extraction code path. */
++	fr_window_archive_extract (self->window,
++				   files,
++				   extraction->destination,
++				   base_dir,
++				   FALSE,		/* skip_older */
++				   FR_OVERWRITE_YES,
++				   FALSE,		/* junk_paths */
++				   FALSE);		/* ask_to_open_destination */
++
++	_g_string_list_free (files);
++	g_free (base_dir);
++	g_free (temp_dir);
++}
++
++
++static gboolean
++fr_dnd_provider_write_mime_type_finish (GdkContentProvider  *provider,
++					GAsyncResult        *result,
++					GError             **error)
++{
++	return g_task_propagate_boolean (G_TASK (result), error);
++}
++
++
++static void
++fr_dnd_provider_class_init (FrDndProviderClass *klass)
++{
++	GdkContentProviderClass *provider_class = GDK_CONTENT_PROVIDER_CLASS (klass);
++
++	provider_class->ref_formats = fr_dnd_provider_ref_formats;
++	provider_class->write_mime_type_async = fr_dnd_provider_write_mime_type_async;
++	provider_class->write_mime_type_finish = fr_dnd_provider_write_mime_type_finish;
++}
++
++
++static void
++fr_dnd_provider_init (FrDndProvider *self)
++{
++	self->window = NULL;
++	self->from_sidebar = FALSE;
++}
++
++
++/* -- drag source -- */
++
++
++typedef struct {
++	FrWindow *window;	/* not owned */
++	gboolean  from_sidebar;
++} SetupData;
++
++
++static GdkContentProvider *
++_fr_dnd_drag_prepare_cb (GtkDragSource *source,
++			 double         x,
++			 double         y,
++			 gpointer       user_data)
++{
++	SetupData     *setup = user_data;
++	FrDndProvider *provider;
++
++	/* Refuse to start a second extraction while one is still running. */
++	if (g_object_get_data (G_OBJECT (setup->window), PENDING_KEY) != NULL)
++		return NULL;
++
++	if (! setup->from_sidebar && (fr_window_get_n_selected_files (setup->window) == 0))
++		return NULL;
++
++	provider = g_object_new (FR_TYPE_DND_PROVIDER, NULL);
++	provider->window = setup->window;
++	provider->from_sidebar = setup->from_sidebar;
++
++	return GDK_CONTENT_PROVIDER (provider);
++}
++
++
++static void
++_fr_dnd_drag_begin_cb (GtkDragSource *source,
++		       GdkDrag       *drag,
++		       gpointer       user_data)
++{
++	GtkWidget        *widget;
++	GtkIconTheme     *theme;
++	GtkIconPaintable *icon;
++
++	widget = gtk_event_controller_get_widget (GTK_EVENT_CONTROLLER (source));
++	if (widget == NULL)
++		return;
++
++	theme = gtk_icon_theme_get_for_display (gtk_widget_get_display (widget));
++	icon = gtk_icon_theme_lookup_icon (theme,
++					   DRAG_ICON_NAME,
++					   NULL,
++					   32,
++					   1,
++					   GTK_TEXT_DIR_NONE,
++					   0);
++	if (icon != NULL) {
++		gtk_drag_source_set_icon (source, GDK_PAINTABLE (icon), 16, 16);
++		g_object_unref (icon);
++	}
++}
++
++
++void
++fr_window_dnd_setup (FrWindow  *window,
++		     GtkWidget *widget,
++		     gboolean   from_sidebar)
++{
++	GtkDragSource *source;
++	SetupData     *setup;
++
++	g_return_if_fail (FR_IS_WINDOW (window));
++	g_return_if_fail (GTK_IS_WIDGET (widget));
++
++	setup = g_new0 (SetupData, 1);
++	setup->window = window;
++	setup->from_sidebar = from_sidebar;
++
++	source = gtk_drag_source_new ();
++	gtk_drag_source_set_actions (source, GDK_ACTION_COPY);
++	gtk_gesture_single_set_button (GTK_GESTURE_SINGLE (source), GDK_BUTTON_PRIMARY);
++
++	/* Run in the bubble phase so that the tree view's own click gesture
++	 * gets to update the selection before a drag can start. */
++	gtk_event_controller_set_propagation_phase (GTK_EVENT_CONTROLLER (source), GTK_PHASE_BUBBLE);
++
++	g_signal_connect_data (source,
++			       "prepare",
++			       G_CALLBACK (_fr_dnd_drag_prepare_cb),
++			       setup,
++			       (GClosureNotify) g_free,
++			       0);
++	g_signal_connect (source,
++			  "drag-begin",
++			  G_CALLBACK (_fr_dnd_drag_begin_cb),
++			  NULL);
++
++	gtk_widget_add_controller (widget, GTK_EVENT_CONTROLLER (source));
++}
+diff --git a/src/fr-window-dnd.h b/src/fr-window-dnd.h
+new file mode 100644
+index 0000000..17e9dce
+--- /dev/null
++++ b/src/fr-window-dnd.h
+@@ -0,0 +1,50 @@
++/* -*- Mode: C; tab-width: 8; indent-tabs-mode: t; c-basic-offset: 8 -*- */
++
++/*
++ *  File-Roller
++ *
++ *  Drag-and-drop extraction: allow the current selection to be dragged
++ *  out of the archive and dropped into a file manager.
++ *
++ *  This replaces the XdndDirectSave (XDS) based implementation that was
++ *  dropped during the GTK4 port. XDS required the drop target to send a
++ *  directory path back to the drag source, which does not map onto the
++ *  Wayland data-transfer model. Instead the selection is extracted into a
++ *  temporary directory while the target is reading the data -- GTK4 content
++ *  providers are asynchronous, so a slow extraction is allowed here -- and
++ *  the resulting files are handed over as an ordinary text/uri-list.
++ */
++
++#ifndef FR_WINDOW_DND_H
++#define FR_WINDOW_DND_H
++
++#include <gtk/gtk.h>
++#include "fr-window.h"
++
++G_BEGIN_DECLS
++
++/**
++ * fr_window_dnd_setup:
++ * @window: the archive window
++ * @widget: the widget to attach the drag source to
++ * @from_sidebar: %TRUE if @widget is the folder tree in the sidebar
++ *
++ * Attaches a #GtkDragSource to @widget so that the current selection can be
++ * dragged out of the archive.
++ */
++void	fr_window_dnd_setup			 (FrWindow  *window,
++						  GtkWidget *widget,
++						  gboolean   from_sidebar);
++
++/**
++ * fr_window_dnd_notify_extraction_finished:
++ *
++ * Called by fr_window_dnd_extraction_finished() when an extraction started
++ * on behalf of a drag operation has completed.
++ */
++void	fr_window_dnd_notify_extraction_finished (FrWindow  *window,
++						  gboolean   error);
++
++G_END_DECLS
++
++#endif /* FR_WINDOW_DND_H */
+diff --git a/src/fr-window.c b/src/fr-window.c
+index 7aa574f..4480456 100644
+--- a/src/fr-window.c
++++ b/src/fr-window.c
+@@ -42,6 +42,7 @@
+ #include "fr-error.h"
+ #include "fr-new-archive-dialog.h"
+ #include "fr-window.h"
++#include "fr-window-dnd.h"
+ #include "fr-window-actions-entries.h"
+ #include "fr-file-data.h"
+ #include "file-utils.h"
+@@ -4843,6 +4844,10 @@ fr_window_construct (FrWindow *window)
+ 			     folder_tree_targets, G_N_ELEMENTS (folder_tree_targets),
+ 			     GDK_ACTION_COPY);*/
+ 
++	/* allow dragging the selection out of the archive */
++	fr_window_dnd_setup (window, private->list_view, FALSE);
++	fr_window_dnd_setup (window, private->tree_view, TRUE);
++
+ 	tree_scrolled_window = gtk_scrolled_window_new ();
+ 	gtk_scrolled_window_set_policy (GTK_SCROLLED_WINDOW (tree_scrolled_window),
+ 					GTK_POLICY_AUTOMATIC,
+@@ -9203,6 +9208,7 @@ fr_window_dnd_extraction_finished (FrWindow *window,
+ 		private->dnd_extract_is_running = FALSE;
+ 		private->dnd_extract_finished_with_error = error;
+ 	}
++	fr_window_dnd_notify_extraction_finished (window, error);
+ }
+ 
+ 
+diff --git a/src/meson.build b/src/meson.build
+index 5d9e1c7..22f0375 100644
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -46,6 +46,7 @@ source_files = files(
+   'fr-process.c',
+   'fr-window-actions-callbacks.c',
+   'fr-window.c',
++  'fr-window-dnd.c',
+   'gio-utils.c',
+   'glib-utils.c',
+   'gtk-utils.c',
+@@ -92,6 +93,7 @@ fr_headers = files(
+   'fr-window-actions-callbacks.h',
+   'fr-window-actions-entries.h',
+   'fr-window.h',
++  'fr-window-dnd.h',
+ )
+ 
+ if libjson_glib_dep.found()

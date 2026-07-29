@@ -1,0 +1,13 @@
+# makepkg
+/src/
+/pkg/
+/file-roller/
+*.pkg.tar.zst
+*.pkg.tar.xz
+
+# build-deb.sh
+/build-deb/
+*.deb
+
+# meson
+/build/
