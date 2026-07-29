@@ -1,4 +1,9 @@
-# file-roller-dnd
+# Disclaimer
+
+Code was made by Claude, I don't care, it works, deal with it
+Still less lazy than GNOME developers 🤷🏻
+
+# file-roller
 
 file-roller 44.7 with drag-and-drop extraction restored.
 
