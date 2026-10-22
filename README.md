@@ -37,6 +37,22 @@ is why the async approach sidesteps the objection that killed the original
 port. No XDS, no path travelling backwards, no new protocol — the file manager
 receives an ordinary list of local files.
 
+The drop target may read the data more than once, and before the drop.
+Nautilus preloads on hover: its file views, every row, the path bar and the
+sidebar each issue their own read when the pointer enters them, and GTK does
+not cache those reads across processes. So the provider runs **one extraction
+per drag**: the first read starts it, later reads queue behind it, and once it
+finishes they all receive the same uri-list (reads after that get the cached
+result immediately). The selection is captured when the drag starts, and no
+drag starts while the archive is busy. An early version of this patch started
+a new extraction for every read, which made drags fail intermittently and
+could crash file-roller (a second extraction frees the data of the one still
+running).
+
+Because of the preload, extraction usually begins as soon as the pointer
+reaches the file manager, not on release. An abandoned drag therefore still
+costs one extraction, whose temporary directory is swept later.
+
 Temporary files live in `$XDG_CACHE_HOME/file-roller/dnd/<pid>-<n>/`. They are
 not deleted when the drag ends, because the file manager copies them *after*
 reading the uri-list. Directories belonging to dead PIDs are swept on first
@@ -77,7 +93,7 @@ file list, not the sidebar.
 
 ## Patch shape (this is deliberate)
 
-    src/fr-window-dnd.c | 513 ++++  (new file)
+    src/fr-window-dnd.c | 563 ++++  (new file)
     src/fr-window-dnd.h |  50 ++++  (new file)
     src/fr-window.c     |   6 ++    (3 hunks: 1 include, 2 setup calls, 1 notify)
     src/meson.build     |   2 ++

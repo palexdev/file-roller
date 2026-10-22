@@ -1,4 +1,4 @@
-From 9be6d8d80e215a6f426590ea3b333c3611ae59eb Mon Sep 17 00:00:00 2001
+From f1728e517a6e6f499d191d56ce6c596ba34b79ea Mon Sep 17 00:00:00 2001
 From: c <a@b>
 Date: Wed, 29 Jul 2026 17:33:32 +0200
 Subject: [PATCH] src: restore drag-and-drop extraction from the archive
@@ -19,20 +19,20 @@ needed.
 Temporary files live in $XDG_CACHE_HOME/file-roller/dnd/<pid>-<n> and
 directories owned by dead PIDs are swept on first use.
 ---
- src/fr-window-dnd.c | 516 ++++++++++++++++++++++++++++++++++++++++++++
- src/fr-window-dnd.h |  50 +++++
+ src/fr-window-dnd.c | 563 ++++++++++++++++++++++++++++++++++++++++++++
+ src/fr-window-dnd.h |  50 ++++
  src/fr-window.c     |   6 +
  src/meson.build     |   2 +
- 4 files changed, 574 insertions(+)
+ 4 files changed, 621 insertions(+)
  create mode 100644 src/fr-window-dnd.c
  create mode 100644 src/fr-window-dnd.h
 
 diff --git a/src/fr-window-dnd.c b/src/fr-window-dnd.c
 new file mode 100644
-index 0000000..c48e1c9
+index 00000000..92df6e0a
 --- /dev/null
 +++ b/src/fr-window-dnd.c
-@@ -0,0 +1,516 @@
+@@ -0,0 +1,563 @@
 +/* -*- Mode: C; tab-width: 8; indent-tabs-mode: t; c-basic-offset: 8 -*- */
 +
 +/*
@@ -202,28 +202,32 @@ index 0000000..c48e1c9
 +}
 +
 +
-+/* -- the extraction in flight -- */
++/* -- FrDndProvider -- */
 +
 +
-+typedef struct {
-+	GTask         *task;		/* owned */
-+	GOutputStream *stream;		/* owned */
-+	GFile         *destination;	/* owned */
-+	char          *uri_list;	/* owned, valid once extraction succeeded */
-+} DragExtraction;
++typedef enum {
++	DND_STATE_IDLE,
++	DND_STATE_EXTRACTING,
++	DND_STATE_DONE,
++	DND_STATE_FAILED
++} DndState;
 +
 +
-+static void
-+drag_extraction_free (gpointer user_data)
-+{
-+	DragExtraction *extraction = user_data;
++#define FR_TYPE_DND_PROVIDER (fr_dnd_provider_get_type ())
++G_DECLARE_FINAL_TYPE (FrDndProvider, fr_dnd_provider, FR, DND_PROVIDER, GdkContentProvider)
 +
-+	g_clear_object (&extraction->task);
-+	g_clear_object (&extraction->stream);
-+	g_clear_object (&extraction->destination);
-+	g_free (extraction->uri_list);
-+	g_free (extraction);
-+}
++struct _FrDndProvider {
++	GdkContentProvider  parent_instance;
++	FrWindow           *window;		/* weak */
++	GList              *files;		/* owned */
++	char               *base_dir;		/* owned */
++	GFile              *destination;	/* owned */
++	DndState            state;
++	char               *uri_list;		/* owned, valid in DND_STATE_DONE */
++	GList              *pending;		/* GTask, owned */
++};
++
++G_DEFINE_TYPE (FrDndProvider, fr_dnd_provider, GDK_TYPE_CONTENT_PROVIDER)
 +
 +
 +/* Builds the text/uri-list payload from the top level of the destination
@@ -277,15 +281,38 @@ index 0000000..c48e1c9
 +			GAsyncResult *result,
 +			gpointer      user_data)
 +{
-+	DragExtraction *extraction = user_data;
-+	GError         *error = NULL;
++	GTask  *task = user_data;
++	GError *error = NULL;
 +
 +	if (! g_output_stream_write_all_finish (G_OUTPUT_STREAM (source_object), result, NULL, &error))
-+		g_task_return_error (extraction->task, error);
++		g_task_return_error (task, error);
 +	else
-+		g_task_return_boolean (extraction->task, TRUE);
++		g_task_return_boolean (task, TRUE);
 +
-+	drag_extraction_free (extraction);
++	g_object_unref (task);
++}
++
++
++static void
++_fr_dnd_provider_reply (FrDndProvider *self,
++			GTask         *task)
++{
++	if (self->state != DND_STATE_DONE) {
++		g_task_return_new_error (task,
++					 G_IO_ERROR,
++					 G_IO_ERROR_FAILED,
++					 "Could not extract the dragged files");
++		g_object_unref (task);
++		return;
++	}
++
++	g_output_stream_write_all_async (g_task_get_task_data (task),
++					 self->uri_list,
++					 strlen (self->uri_list),
++					 G_PRIORITY_DEFAULT,
++					 g_task_get_cancellable (task),
++					 _fr_dnd_write_ready_cb,
++					 task);
 +}
 +
 +
@@ -293,54 +320,69 @@ index 0000000..c48e1c9
 +fr_window_dnd_notify_extraction_finished (FrWindow *window,
 +					  gboolean  error)
 +{
-+	DragExtraction *extraction;
++	FrDndProvider *self;
++	GList         *pending;
++	GList         *scan;
 +
-+	extraction = g_object_steal_data (G_OBJECT (window), PENDING_KEY);
-+	if (extraction == NULL)
++	self = g_object_steal_data (G_OBJECT (window), PENDING_KEY);
++	if (self == NULL)
 +		return;
 +
-+	if (error) {
-+		g_task_return_new_error (extraction->task,
-+					 G_IO_ERROR,
-+					 G_IO_ERROR_FAILED,
-+					 "Could not extract the dragged files");
-+		drag_extraction_free (extraction);
-+		return;
-+	}
++	if (! error)
++		self->uri_list = _fr_dnd_build_uri_list (self->destination);
++	self->state = (self->uri_list != NULL) ? DND_STATE_DONE : DND_STATE_FAILED;
 +
-+	extraction->uri_list = _fr_dnd_build_uri_list (extraction->destination);
-+	if (extraction->uri_list == NULL) {
-+		g_task_return_new_error (extraction->task,
-+					 G_IO_ERROR,
-+					 G_IO_ERROR_NOT_FOUND,
-+					 "No files were extracted");
-+		drag_extraction_free (extraction);
-+		return;
-+	}
++	pending = g_list_reverse (self->pending);
++	self->pending = NULL;
++	for (scan = pending; scan; scan = scan->next)
++		_fr_dnd_provider_reply (self, scan->data);
 +
-+	g_output_stream_write_all_async (extraction->stream,
-+					 extraction->uri_list,
-+					 strlen (extraction->uri_list),
-+					 G_PRIORITY_DEFAULT,
-+					 g_task_get_cancellable (extraction->task),
-+					 _fr_dnd_write_ready_cb,
-+					 extraction);
++	g_list_free (pending);
++	g_object_unref (self);
 +}
 +
 +
-+/* -- FrDndProvider -- */
++static gboolean
++_fr_dnd_provider_start_extraction (FrDndProvider  *self,
++				   GError        **error)
++{
++	char *temp_dir;
 +
++	if (self->window == NULL) {
++		g_set_error (error, G_IO_ERROR, G_IO_ERROR_CANCELLED,
++			     "The archive window is gone");
++		return FALSE;
++	}
 +
-+#define FR_TYPE_DND_PROVIDER (fr_dnd_provider_get_type ())
-+G_DECLARE_FINAL_TYPE (FrDndProvider, fr_dnd_provider, FR, DND_PROVIDER, GdkContentProvider)
++	if (g_object_get_data (G_OBJECT (self->window), PENDING_KEY) != NULL) {
++		g_set_error (error, G_IO_ERROR, G_IO_ERROR_BUSY,
++			     "Another extraction is running");
++		return FALSE;
++	}
 +
-+struct _FrDndProvider {
-+	GdkContentProvider  parent_instance;
-+	FrWindow           *window;		/* not owned */
-+	gboolean            from_sidebar;
-+};
++	temp_dir = _fr_dnd_create_temp_dir (error);
++	if (temp_dir == NULL)
++		return FALSE;
 +
-+G_DEFINE_TYPE (FrDndProvider, fr_dnd_provider, GDK_TYPE_CONTENT_PROVIDER)
++	self->destination = g_file_new_for_path (temp_dir);
++	self->state = DND_STATE_EXTRACTING;
++	g_object_set_data_full (G_OBJECT (self->window), PENDING_KEY, g_object_ref (self), g_object_unref);
++
++	/* Completion arrives via fr_window_dnd_extraction_finished(), which
++	 * fr-window.c already calls on every extraction code path. */
++	fr_window_archive_extract (self->window,
++				   self->files,
++				   self->destination,
++				   self->base_dir,
++				   FALSE,		/* skip_older */
++				   FR_OVERWRITE_YES,
++				   FALSE,		/* junk_paths */
++				   FALSE);		/* ask_to_open_destination */
++
++	g_free (temp_dir);
++
++	return TRUE;
++}
 +
 +
 +static GdkContentFormats *
@@ -364,63 +406,33 @@ index 0000000..c48e1c9
 +				       GAsyncReadyCallback  callback,
 +				       gpointer             user_data)
 +{
-+	FrDndProvider  *self = FR_DND_PROVIDER (provider);
-+	GTask          *task;
-+	GList          *files;
-+	char           *base_dir = NULL;
-+	char           *temp_dir;
-+	DragExtraction *extraction;
-+	GError         *error = NULL;
++	FrDndProvider *self = FR_DND_PROVIDER (provider);
++	GTask         *task;
++	GError        *error = NULL;
 +
 +	task = g_task_new (provider, cancellable, callback, user_data);
 +	g_task_set_source_tag (task, fr_dnd_provider_write_mime_type_async);
++	g_task_set_task_data (task, g_object_ref (stream), g_object_unref);
 +
-+	if (self->window == NULL) {
-+		g_task_return_new_error (task, G_IO_ERROR, G_IO_ERROR_CANCELLED,
-+					 "The archive window is gone");
-+		g_object_unref (task);
-+		return;
++	switch (self->state) {
++	case DND_STATE_DONE:
++	case DND_STATE_FAILED:
++		_fr_dnd_provider_reply (self, task);
++		break;
++
++	case DND_STATE_EXTRACTING:
++		self->pending = g_list_prepend (self->pending, task);
++		break;
++
++	case DND_STATE_IDLE:
++		self->pending = g_list_prepend (self->pending, task);
++		if (! _fr_dnd_provider_start_extraction (self, &error)) {
++			self->pending = g_list_remove (self->pending, task);
++			g_task_return_error (task, error);
++			g_object_unref (task);
++		}
++		break;
 +	}
-+
-+	files = fr_window_get_selection (self->window, self->from_sidebar, &base_dir);
-+	if (files == NULL) {
-+		g_task_return_new_error (task, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT,
-+					 "Nothing to extract");
-+		g_free (base_dir);
-+		g_object_unref (task);
-+		return;
-+	}
-+
-+	temp_dir = _fr_dnd_create_temp_dir (&error);
-+	if (temp_dir == NULL) {
-+		g_task_return_error (task, error);
-+		_g_string_list_free (files);
-+		g_free (base_dir);
-+		g_object_unref (task);
-+		return;
-+	}
-+
-+	extraction = g_new0 (DragExtraction, 1);
-+	extraction->task = task;			/* takes ownership */
-+	extraction->stream = g_object_ref (stream);
-+	extraction->destination = g_file_new_for_path (temp_dir);
-+
-+	g_object_set_data (G_OBJECT (self->window), PENDING_KEY, extraction);
-+
-+	/* Completion arrives via fr_window_dnd_extraction_finished(), which
-+	 * fr-window.c already calls on every extraction code path. */
-+	fr_window_archive_extract (self->window,
-+				   files,
-+				   extraction->destination,
-+				   base_dir,
-+				   FALSE,		/* skip_older */
-+				   FR_OVERWRITE_YES,
-+				   FALSE,		/* junk_paths */
-+				   FALSE);		/* ask_to_open_destination */
-+
-+	_g_string_list_free (files);
-+	g_free (base_dir);
-+	g_free (temp_dir);
 +}
 +
 +
@@ -434,9 +446,27 @@ index 0000000..c48e1c9
 +
 +
 +static void
++fr_dnd_provider_finalize (GObject *object)
++{
++	FrDndProvider *self = FR_DND_PROVIDER (object);
++
++	g_clear_weak_pointer (&self->window);
++	_g_string_list_free (self->files);
++	g_free (self->base_dir);
++	g_clear_object (&self->destination);
++	g_free (self->uri_list);
++
++	G_OBJECT_CLASS (fr_dnd_provider_parent_class)->finalize (object);
++}
++
++
++static void
 +fr_dnd_provider_class_init (FrDndProviderClass *klass)
 +{
++	GObjectClass            *object_class = G_OBJECT_CLASS (klass);
 +	GdkContentProviderClass *provider_class = GDK_CONTENT_PROVIDER_CLASS (klass);
++
++	object_class->finalize = fr_dnd_provider_finalize;
 +
 +	provider_class->ref_formats = fr_dnd_provider_ref_formats;
 +	provider_class->write_mime_type_async = fr_dnd_provider_write_mime_type_async;
@@ -448,7 +478,12 @@ index 0000000..c48e1c9
 +fr_dnd_provider_init (FrDndProvider *self)
 +{
 +	self->window = NULL;
-+	self->from_sidebar = FALSE;
++	self->files = NULL;
++	self->base_dir = NULL;
++	self->destination = NULL;
++	self->state = DND_STATE_IDLE;
++	self->uri_list = NULL;
++	self->pending = NULL;
 +}
 +
 +
@@ -469,17 +504,29 @@ index 0000000..c48e1c9
 +{
 +	SetupData     *setup = user_data;
 +	FrDndProvider *provider;
++	GList         *files;
++	char          *base_dir = NULL;
 +
 +	/* Refuse to start a second extraction while one is still running. */
 +	if (g_object_get_data (G_OBJECT (setup->window), PENDING_KEY) != NULL)
 +		return NULL;
 +
++	if (! g_action_group_get_action_enabled (G_ACTION_GROUP (setup->window), "extract-files"))
++		return NULL;
++
 +	if (! setup->from_sidebar && (fr_window_get_n_selected_files (setup->window) == 0))
 +		return NULL;
 +
++	files = fr_window_get_selection (setup->window, setup->from_sidebar, &base_dir);
++	if (files == NULL) {
++		g_free (base_dir);
++		return NULL;
++	}
++
 +	provider = g_object_new (FR_TYPE_DND_PROVIDER, NULL);
-+	provider->window = setup->window;
-+	provider->from_sidebar = setup->from_sidebar;
++	g_set_weak_pointer (&provider->window, setup->window);
++	provider->files = files;
++	provider->base_dir = base_dir;
 +
 +	return GDK_CONTENT_PROVIDER (provider);
 +}
@@ -551,7 +598,7 @@ index 0000000..c48e1c9
 +}
 diff --git a/src/fr-window-dnd.h b/src/fr-window-dnd.h
 new file mode 100644
-index 0000000..17e9dce
+index 00000000..17e9dce3
 --- /dev/null
 +++ b/src/fr-window-dnd.h
 @@ -0,0 +1,50 @@
@@ -606,7 +653,7 @@ index 0000000..17e9dce
 +
 +#endif /* FR_WINDOW_DND_H */
 diff --git a/src/fr-window.c b/src/fr-window.c
-index 7aa574f..4480456 100644
+index 7aa574fb..4480456b 100644
 --- a/src/fr-window.c
 +++ b/src/fr-window.c
 @@ -42,6 +42,7 @@
@@ -637,7 +684,7 @@ index 7aa574f..4480456 100644
  
  
 diff --git a/src/meson.build b/src/meson.build
-index 5d9e1c7..22f0375 100644
+index 5d9e1c73..22f03753 100644
 --- a/src/meson.build
 +++ b/src/meson.build
 @@ -46,6 +46,7 @@ source_files = files(

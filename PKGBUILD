@@ -78,8 +78,8 @@ source=("git+https://gitlab.gnome.org/GNOME/file-roller.git#tag=$pkgver"
         'file-roller-restore-dnd-extraction.patch'
         'file-roller-dnd-keep-selection.patch')
 b2sums=('6f3a05d08c3f0f96e54b04e725e7cb90518e25614463017fdd53e816299ecb832aaa51de606975b650af30bd4a7021fd5dd111895de5a0634b733a8a60a8219a'
-        '8032849a5f1ade89265e1d225ff94d17f458fe294d9e58ff57e871656000e97633677d3c0a25382f4228abfa53b362819d169b45db3c2914d7370bbbd4ce12d9'
-        'a5d2b733c6aad54584fad442bbb28ab77376870143b6e71d259f8a2666343715021b98c76faa278feb7f89ba34dc83ce07a591ebc7a758bdc8155b30fb5942dd')
+        '9f36607cfc7412a63a9070dd047af53551d8f841419ae8a698e7f3deeb9405d4bb89f7f45be3e02d2ec2cb5389285a9f9c622e4fa4ef1f53dbb5404f30131077'
+        '75eb387407092f01591cafa87c71f40def134ec3bb16e47e0c9ec5460aa6cd5e77b162331c3b421e665aaf03f9f8f24bff363dcfbf8f98add47d99a21d335cc5')
 
 prepare() {
   cd $_pkgname

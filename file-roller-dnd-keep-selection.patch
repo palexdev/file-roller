@@ -1,4 +1,4 @@
-From 9f0355ea37cb362e8b22c43a2e0bbc959d31a198 Mon Sep 17 00:00:00 2001
+From 276903525445134b1e6eb9f320747f03247b48df Mon Sep 17 00:00:00 2001
 From: c <a@b>
 Date: Wed, 29 Jul 2026 17:59:24 +0200
 Subject: [PATCH] dnd: keep the selection intact when a drag starts
@@ -22,10 +22,10 @@ This is independent of the extraction support and can be dropped.
  1 file changed, 202 insertions(+), 9 deletions(-)
 
 diff --git a/src/fr-window-dnd.c b/src/fr-window-dnd.c
-index c48e1c9..ec42f79 100644
+index 92df6e0a..3640a7e7 100644
 --- a/src/fr-window-dnd.c
 +++ b/src/fr-window-dnd.c
-@@ -421,11 +421,177 @@ fr_dnd_provider_init (FrDndProvider *self)
+@@ -456,11 +456,177 @@ fr_dnd_provider_init (FrDndProvider *self)
  
  
  typedef struct {
@@ -205,7 +205,7 @@ index c48e1c9..ec42f79 100644
  static GdkContentProvider *
  _fr_dnd_drag_prepare_cb (GtkDragSource *source,
  			 double         x,
-@@ -455,10 +621,14 @@ _fr_dnd_drag_begin_cb (GtkDragSource *source,
+@@ -502,10 +668,14 @@ _fr_dnd_drag_begin_cb (GtkDragSource *source,
  		       GdkDrag       *drag,
  		       gpointer       user_data)
  {
@@ -220,7 +220,7 @@ index c48e1c9..ec42f79 100644
  	widget = gtk_event_controller_get_widget (GTK_EVENT_CONTROLLER (source));
  	if (widget == NULL)
  		return;
-@@ -493,6 +663,10 @@ fr_window_dnd_setup (FrWindow  *window,
+@@ -540,6 +710,10 @@ fr_window_dnd_setup (FrWindow  *window,
  	setup->window = window;
  	setup->from_sidebar = from_sidebar;
  
@@ -231,7 +231,7 @@ index c48e1c9..ec42f79 100644
  	source = gtk_drag_source_new ();
  	gtk_drag_source_set_actions (source, GDK_ACTION_COPY);
  	gtk_gesture_single_set_button (GTK_GESTURE_SINGLE (source), GDK_BUTTON_PRIMARY);
-@@ -501,16 +675,35 @@ fr_window_dnd_setup (FrWindow  *window,
+@@ -548,16 +722,35 @@ fr_window_dnd_setup (FrWindow  *window,
  	 * gets to update the selection before a drag can start. */
  	gtk_event_controller_set_propagation_phase (GTK_EVENT_CONTROLLER (source), GTK_PHASE_BUBBLE);
  
